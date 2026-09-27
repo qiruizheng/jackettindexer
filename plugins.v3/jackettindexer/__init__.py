@@ -54,7 +54,7 @@ class jackettindexer(_PluginBase):
     # ---- 插件元信息（MoviePilot 后台展示用）----
     plugin_name = "Jackett 索引器"
     plugin_desc = "将 Jackett 作为站点接入 MoviePilot 搜索，返回全部索引器聚合结果。"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "Qiruizheng"
     author_url = ""
 
@@ -65,7 +65,7 @@ class jackettindexer(_PluginBase):
         "api_key": "irzy7mdb318o91wrwai1q9p91cdvvivr",
         "site_name": "Jackett",
         "indexer": "all",
-        "timeout": 30,
+        "timeout": 90,
         "filter_by_type": False,
         "proxy": False,
     }
@@ -295,7 +295,7 @@ class jackettindexer(_PluginBase):
         base = str(self._config.get("jackett_url") or "").rstrip("/")
         api_key = self._config.get("api_key")
         indexer = self._config.get("indexer") or "all"
-        timeout = int(self._config.get("timeout") or 30)
+        timeout = int(self._config.get("timeout") or 90)
         site_name = self._config.get("site_name") or "Jackett"
         if not base or not api_key:
             logger.warning("Jackett 地址或 API Key 未配置，跳过搜索")
@@ -377,7 +377,7 @@ class jackettindexer(_PluginBase):
 
             torrents.append(
                 TorrentInfo(
-                    site=site_name,
+                    site=0,
                     site_name=site_name,
                     site_proxy=bool(self._config.get("proxy")),
                     title=title,
