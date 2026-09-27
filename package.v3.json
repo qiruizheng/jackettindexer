@@ -3,9 +3,9 @@
     "id": "jackettindexer",
     "name": "Jackett 索引器",
     "author": "Qiruizheng",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "v3": true,
-    "description": "将 Jackett 作为站点接入 MoviePilot v3：启用后自动在站点管理注册 Jackett 站点，搜索返回所有索引器聚合结果并归属该站点。",
+    "description": "将 Jackett 作为站点接入 MoviePilot v3：自动注册站点、中文名经 TMDB 转英文原名检索并过滤无关结果。",
     "level": 0
   }
 }

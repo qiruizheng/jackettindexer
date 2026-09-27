@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional
 
@@ -57,7 +58,7 @@ class jackettindexer(_PluginBase):
     # ---- 插件元信息（MoviePilot 后台展示用）----
     plugin_name = "Jackett 索引器"
     plugin_desc = "将 Jackett 作为站点接入 MoviePilot，返回全部索引器聚合结果。"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "Qiruizheng"
     author_url = ""
 
@@ -73,6 +74,8 @@ class jackettindexer(_PluginBase):
         "timeout": 90,
         "filter_by_type": False,
         "proxy": False,
+        "use_tmdb": True,
+        "strict_match": True,
     }
 
     def __init__(self) -> None:
@@ -80,6 +83,7 @@ class jackettindexer(_PluginBase):
         self._enabled = False
         self._config: Dict[str, Any] = dict(self._default_config)
         self._site_id: Optional[int] = None
+        self._title_cache: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # 生命周期 / 配置
@@ -325,6 +329,41 @@ class jackettindexer(_PluginBase):
                             "content": [
                                 {
                                     "component": "VCol",
+                                    "props": {"cols": 12, "md": 6},
+                                    "content": [
+                                        {
+                                            "component": "VSwitch",
+                                            "props": {
+                                                "label": "中文名转英文原名检索(TMDB)",
+                                                "model": "use_tmdb",
+                                                "hint": "Jackett 多为英文索引器，中文关键词会检索不到",
+                                            },
+                                            "id": "use_tmdb",
+                                        }
+                                    ],
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 6},
+                                    "content": [
+                                        {
+                                            "component": "VSwitch",
+                                            "props": {
+                                                "label": "过滤无关结果",
+                                                "model": "strict_match",
+                                                "hint": "剔除标题不含检索词的结果",
+                                            },
+                                            "id": "strict_match",
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                {
+                                    "component": "VCol",
                                     "props": {"cols": 12},
                                     "content": [
                                         {
@@ -414,7 +453,12 @@ class jackettindexer(_PluginBase):
             logger.warning("Jackett 地址或 API Key 未配置，跳过搜索")
             return []
 
-        params: Dict[str, Any] = {"apikey": api_key, "t": "search", "q": keyword}
+        # Jackett 聚合的多为英文索引器，中文关键词匹配不到会退回返回各站最新种子，
+        # 因此先经 TMDB 把中文名解析成英文原名，再交给 Jackett 检索。
+        query = self._resolve_query(keyword, mtype)
+        logger.info("Jackett 检索词：%s（原始关键词：%s）", query, keyword)
+
+        params: Dict[str, Any] = {"apikey": api_key, "t": "search", "q": query}
         if self._config.get("filter_by_type") and mtype is not None:
             cat = self._mtype_to_cat(mtype)
             if cat:
@@ -431,7 +475,115 @@ class jackettindexer(_PluginBase):
             proxies={"http": None, "https": None},
         )
         resp.raise_for_status()
-        return self._parse(resp.text, site_name=site_name, host=base)
+        return self._parse(
+            resp.text,
+            site_name=site_name,
+            host=base,
+            match_query=query if self._config.get("strict_match") else None,
+        )
+
+    # ------------------------------------------------------------------
+    # 关键词解析：中文 -> TMDB 英文原名
+    # ------------------------------------------------------------------
+    def _resolve_query(self, keyword: str, mtype=None) -> str:
+        """把中文关键词解析为英文原名；已是英文或解析失败时原样返回。"""
+        kw = (keyword or "").strip()
+        if not kw or self._has_ascii_letters(kw):
+            return kw
+        if not self._config.get("use_tmdb"):
+            return kw
+        if kw in self._title_cache:
+            return self._title_cache[kw]
+        title = self._tmdb_en_title(kw, mtype)
+        self._title_cache[kw] = title or kw
+        return self._title_cache[kw]
+
+    @staticmethod
+    def _has_ascii_letters(text: str) -> bool:
+        return any("a" <= c.lower() <= "z" for c in text if c.isalpha() and ord(c) < 128)
+
+    def _tmdb_en_title(self, keyword: str, mtype=None) -> Optional[str]:
+        """经 TMDB 把中文名解析为英文标题（先中文搜出 ID，再取 en-US 详情）。"""
+        try:
+            from app.core.config import settings
+
+            api_key = getattr(settings, "TMDB_API_KEY", None)
+            domain = getattr(settings, "TMDB_API_DOMAIN", None) or "api.tmdb.org"
+            proxies = getattr(settings, "PROXY", None)
+            if not api_key:
+                return None
+        except Exception as exc:
+            logger.warning("读取 TMDB 配置失败：%s", exc)
+            return None
+
+        # 按媒体类型决定优先检索电影还是剧集
+        order = ("movie", "tv")
+        try:
+            v = mtype.value if hasattr(mtype, "value") else str(mtype)
+        except Exception:
+            v = ""
+        if v in ("TV", "电视剧"):
+            order = ("tv", "movie")
+
+        for media_type in order:
+            try:
+                r = requests.get(
+                    f"https://{domain}/3/search/{media_type}",
+                    params={"api_key": api_key, "query": keyword, "language": "zh-CN"},
+                    proxies=proxies,
+                    timeout=20,
+                )
+                results = (r.json() or {}).get("results") or []
+                if not results:
+                    continue
+                tmdb_id = results[0].get("id")
+                if not tmdb_id:
+                    continue
+                d = requests.get(
+                    f"https://{domain}/3/{media_type}/{tmdb_id}",
+                    params={"api_key": api_key, "language": "en-US"},
+                    proxies=proxies,
+                    timeout=20,
+                ).json() or {}
+                title = d.get("title") or d.get("name") or d.get("original_title") or d.get("original_name")
+                if title:
+                    logger.info("TMDB 解析：%s -> %s（%s）", keyword, title, media_type)
+                    return str(title)
+            except Exception as exc:
+                logger.warning("TMDB 解析失败（%s）：%s", media_type, exc)
+        return None
+
+    # ------------------------------------------------------------------
+    # 相关性过滤：剔除 Jackett 无匹配时回吐的无关种子
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize(text: str) -> str:
+        return " " + re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", (text or "").lower()).strip() + " "
+
+    @classmethod
+    def _tokens(cls, query: str) -> List[str]:
+        """英文按词切分（去停用词），中文按整串保留。"""
+        raw = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", " ", query or "").strip()
+        if not raw:
+            return []
+        if cls._has_ascii_letters(raw):
+            return [t for t in raw.lower().split() if t not in ("the", "a", "an", "of", "and")]
+        return [raw.lower()]
+
+    def _relevant(self, title: str, query: str) -> bool:
+        """标题需包含检索词的全部有效词元，否则视为无关。"""
+        tokens = self._tokens(query)
+        if not tokens:
+            return True
+        norm = self._normalize(title)
+        for t in tokens:
+            if len(t) == 1:
+                continue
+            if t.isdigit():
+                continue
+            if (" " + t + " ") not in norm and t not in norm:
+                return False
+        return True
 
     @staticmethod
     def _mtype_to_cat(mtype) -> Optional[str]:
@@ -447,7 +599,13 @@ class jackettindexer(_PluginBase):
             return "3000"
         return None
 
-    def _parse(self, xml_text: str, site_name: str, host: str) -> List[Any]:
+    def _parse(
+        self,
+        xml_text: str,
+        site_name: str,
+        host: str,
+        match_query: Optional[str] = None,
+    ) -> List[Any]:
         torrents: List[Any] = []
         try:
             root = ET.fromstring(xml_text)
@@ -457,10 +615,15 @@ class jackettindexer(_PluginBase):
 
         # v3 的 TorrentInfo.site 必须是 int（站点ID），不能是字符串
         site_id = int(self._site_id or 0)
+        total = 0
 
         for item in root.iter("item"):
             title = (item.findtext("title") or "").strip()
             if not title:
+                continue
+            total += 1
+            # 剔除与检索词无关的条目（Jackett 无匹配时索引器会回吐最新种子）
+            if match_query and not self._relevant(title, match_query):
                 continue
             encl = item.find("enclosure")
             enclosure = (encl.get("url") if encl is not None else None) or item.findtext(
@@ -511,7 +674,13 @@ class jackettindexer(_PluginBase):
                     labels=[site_name],
                 )
             )
-        logger.info("Jackett 返回 %d 条结果（关键词：%s）", len(torrents), self._last_keyword)
+        logger.info(
+            "Jackett 返回 %d 条结果（原始 %d 条，关键词：%s，检索词：%s）",
+            len(torrents),
+            total,
+            self._last_keyword,
+            match_query or self._last_keyword,
+        )
         return torrents
 
     # ------------------------------------------------------------------
