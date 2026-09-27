@@ -1,0 +1,11 @@
+{
+  "jackettindexer": {
+    "id": "jackettindexer",
+    "name": "Jackett 索引器",
+    "author": "Qiruizheng",
+    "version": "1.0.0",
+    "v3": true,
+    "description": "将 Jackett 作为站点接入 MoviePilot v3 搜索，返回所有索引器聚合结果。",
+    "level": 0
+  }
+}
