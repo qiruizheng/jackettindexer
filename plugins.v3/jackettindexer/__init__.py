@@ -2,11 +2,13 @@
 """
 Jackett 索引器插件（MoviePilot v3）
 
-把 Jackett 作为一个「站点」接入 MoviePilot 的统一搜索：
-- 通过 get_module() 把 search_torrents 注册为插件资源搜索源；
-- MoviePilot 在搜索影视时，会调用 search_plugin_torrents 合并所有插件结果，
-  本插件随即查询 Jackett 的 torznab API（默认聚合全部索引器 /api/v2.0/indexers/all/...），
-  把返回的种子以 TorrentInfo 形式回灌进搜索结果，站点名显示为「Jackett」。
+把 Jackett 作为一个「站点」接入 MoviePilot：
+- 插件启用时自动调用 SitesHelper.add_indexer() 注册 Jackett 索引器，
+  并把站点写入站点表 —— 于是「站点管理」里会出现一个 Jackett 站点；
+- 通过 get_module() 把 search_torrents 注册为插件资源搜索源，
+  MoviePilot 搜索影视时会调用 search_plugin_torrents 合并插件结果，
+  本插件查询 Jackett 的 torznab API（默认聚合全部索引器 indexer=all），
+  把种子以 TorrentInfo 回灌搜索结果，且 site 指向自动注册的 Jackett 站点。
 
 仓库结构（MoviePilot 插件市场格式）：
   package.v3.json                      <- 插件索引（市场清单），键/id 与目录名、类名保持一致
@@ -16,12 +18,11 @@ Jackett 索引器插件（MoviePilot v3）
 作为 plugin_id；二者必须完全一致，否则 /api/v1/plugin/form 会返回 404（配置加载失败）。
 本插件目录名、类名、package id 统一为 jackettindexer。
 
-使用方式：
-  1. 在 MoviePilot 后台「系统设置 -> 插件 -> 插件市场」追加本仓库地址
-     https://github.com/<你的用户名>/<本仓库名>
-  2. 刷新市场，找到「Jackett 索引器」并安装；
-  3. 启用插件，在配置中填写 Jackett 地址与 API Key（默认已填局域网地址）；
-  4. 搜索影视时，结果中会出现 site=Jackett 的条目。
+已知实现约束（v3）：
+- 站点搜索走 async_search_site_torrents -> async_execute_system_modules，**不调用插件模块**，
+  因此 v3 无法像 v2 那样由插件「胁持」某个站点的搜索实现。
+- 站点搜索由内置 SiteSpider（HTML 抓取）完成，MoviePilot v3 **没有通用 torznab 解析器**，
+  所以自动注册的 Jackett 站点负责「在站点管理里可见、可管理」，真实检索结果仍由本插件提供。
 """
 
 from __future__ import annotations
@@ -48,13 +49,15 @@ except Exception:  # pragma: no cover - 独立运行兜底
 
 
 _TORZNAB_NS = {"torznab": "http://torznab.com/schemas/2015/feed"}
+# 自动注册站点使用的域名（站点管理里以此标识 Jackett）
+_DEFAULT_SITE_DOMAIN = "jackett.indexer"
 
 
 class jackettindexer(_PluginBase):
     # ---- 插件元信息（MoviePilot 后台展示用）----
     plugin_name = "Jackett 索引器"
-    plugin_desc = "将 Jackett 作为站点接入 MoviePilot 搜索，返回全部索引器聚合结果。"
-    plugin_version = "1.1.0"
+    plugin_desc = "将 Jackett 作为站点接入 MoviePilot，返回全部索引器聚合结果。"
+    plugin_version = "1.2.0"
     plugin_author = "Qiruizheng"
     author_url = ""
 
@@ -64,6 +67,8 @@ class jackettindexer(_PluginBase):
         "jackett_url": "http://192.168.2.220:9117",
         "api_key": "irzy7mdb318o91wrwai1q9p91cdvvivr",
         "site_name": "Jackett",
+        "site_domain": _DEFAULT_SITE_DOMAIN,
+        "register_site": True,
         "indexer": "all",
         "timeout": 90,
         "filter_by_type": False,
@@ -74,6 +79,7 @@ class jackettindexer(_PluginBase):
         super().__init__()
         self._enabled = False
         self._config: Dict[str, Any] = dict(self._default_config)
+        self._site_id: Optional[int] = None
 
     # ------------------------------------------------------------------
     # 生命周期 / 配置
@@ -83,7 +89,13 @@ class jackettindexer(_PluginBase):
         if config:
             self._config.update(config)
         self._enabled = bool(self._config.get("enabled"))
-        logger.info("Jackett 索引器插件初始化完成，启用状态=%s", self._enabled)
+        if self._enabled and self._config.get("register_site"):
+            self._site_id = self._ensure_site()
+        logger.info(
+            "Jackett 索引器插件初始化完成，启用状态=%s，站点ID=%s",
+            self._enabled,
+            self._site_id,
+        )
 
     def get_state(self) -> bool:
         return self._enabled
@@ -93,6 +105,68 @@ class jackettindexer(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         return []
+
+    # ------------------------------------------------------------------
+    # 站点注册：让「站点管理」里出现 Jackett 站点
+    # ------------------------------------------------------------------
+    def _ensure_site(self) -> Optional[int]:
+        """注册 Jackett 索引器并写入站点表，返回站点 ID（失败返回 None）。"""
+        base = str(self._config.get("jackett_url") or "").rstrip("/")
+        site_name = self._config.get("site_name") or "Jackett"
+        api_key = self._config.get("api_key") or ""
+        domain = str(self._config.get("site_domain") or _DEFAULT_SITE_DOMAIN).strip()
+        url = base + "/"
+        if not base:
+            return None
+
+        # 1) 注册索引器：使站点域名可被 MoviePilot 识别（add_site 校验依赖它）
+        try:
+            from app.application.site.sites import SitesHelper
+
+            helper = SitesHelper()
+            try:
+                exists = helper.get_indexer(domain)
+            except Exception:
+                exists = None
+            if not exists:
+                helper.add_indexer(
+                    domain,
+                    {
+                        "id": "jackett",
+                        "name": site_name,
+                        "url": url,
+                        "public": True,
+                    },
+                )
+                logger.info("已注册 Jackett 索引器：%s", domain)
+        except Exception as exc:  # 注册失败不影响插件搜索能力
+            logger.warning("注册 Jackett 索引器失败（不影响搜索）：%s", exc)
+
+        # 2) 写入站点表：站点管理里即可见
+        try:
+            from app.db.oper.site import SiteOper
+
+            oper = SiteOper()
+            site = oper.get_by_domain(domain)
+            if site is not None:
+                return getattr(site, "id", None)
+            ok, msg = oper.add(
+                name=site_name,
+                domain=domain,
+                url=url,
+                apikey=api_key,
+                public=1,
+                is_active=1,
+                proxy=1 if self._config.get("proxy") else 0,
+                render=0,
+                note="由 jackettindexer 插件自动注册（结果由插件 torznab 检索提供）",
+            )
+            logger.info("写入 Jackett 站点：%s（success=%s）", msg, ok)
+            site = oper.get_by_domain(domain)
+            return getattr(site, "id", None) if site is not None else None
+        except Exception as exc:
+            logger.warning("写入 Jackett 站点失败（不影响搜索）：%s", exc)
+            return None
 
     def get_form(self):
         # 顶层用单个 VForm 根组件包裹，符合 MoviePilot v3 前端渲染契约
@@ -184,11 +258,12 @@ class jackettindexer(_PluginBase):
                                         {
                                             "component": "VTextField",
                                             "props": {
-                                                "label": "索引器ID (all=全部)",
-                                                "model": "indexer",
-                                                "placeholder": "all",
+                                                "label": "站点域名",
+                                                "model": "site_domain",
+                                                "placeholder": "jackett.indexer",
+                                                "hint": "自动注册到站点管理时使用的唯一域名",
                                             },
-                                            "id": "indexer",
+                                            "id": "site_domain",
                                         }
                                     ],
                                 },
@@ -199,11 +274,47 @@ class jackettindexer(_PluginBase):
                                         {
                                             "component": "VTextField",
                                             "props": {
+                                                "label": "索引器ID (all=全部)",
+                                                "model": "indexer",
+                                                "placeholder": "all",
+                                            },
+                                            "id": "indexer",
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 6},
+                                    "content": [
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
                                                 "label": "超时(秒)",
                                                 "model": "timeout",
                                                 "type": "number",
+                                                "hint": "indexer=all 聚合较慢，建议不小于 90",
                                             },
                                             "id": "timeout",
+                                        }
+                                    ],
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 6},
+                                    "content": [
+                                        {
+                                            "component": "VSwitch",
+                                            "props": {
+                                                "label": "自动注册为站点",
+                                                "model": "register_site",
+                                                "hint": "启用后在「站点管理」中出现 Jackett 站点",
+                                            },
+                                            "id": "register_site",
                                         }
                                     ],
                                 },
@@ -235,6 +346,7 @@ class jackettindexer(_PluginBase):
         )
 
     def get_page(self):
+        domain = self._config.get("site_domain") or _DEFAULT_SITE_DOMAIN
         return [
             {
                 "component": "VCard",
@@ -245,11 +357,12 @@ class jackettindexer(_PluginBase):
                         "content": [
                             f"Jackett 索引器当前"
                             f"{'已启用' if self._enabled else '已停用'}。\n"
-                            f"搜索影视时将通过 "
-                            f"{self._config.get('jackett_url')} 的 torznab 接口"
-                            f"（索引器：{self._config.get('indexer') or 'all'}）"
-                            f"返回全部聚合结果，站点名显示为"
-                            f"「{self._config.get('site_name') or 'Jackett'}」。"
+                            f"检索地址：{self._config.get('jackett_url')} 的 torznab 接口"
+                            f"（索引器：{self._config.get('indexer') or 'all'}）。\n"
+                            f"站点管理：域名 {domain}"
+                            f"，站点ID {self._site_id if self._site_id else '未注册'}。\n"
+                            f"站点由本插件自动注册；检索结果由插件 torznab 聚合后回灌，"
+                            f"并归属到该站点。"
                         ],
                     }
                 ],
@@ -342,6 +455,9 @@ class jackettindexer(_PluginBase):
             logger.error("Jackett 返回 XML 解析失败：%s", exc)
             return []
 
+        # v3 的 TorrentInfo.site 必须是 int（站点ID），不能是字符串
+        site_id = int(self._site_id or 0)
+
         for item in root.iter("item"):
             title = (item.findtext("title") or "").strip()
             if not title:
@@ -377,7 +493,7 @@ class jackettindexer(_PluginBase):
 
             torrents.append(
                 TorrentInfo(
-                    site=0,
+                    site=site_id,
                     site_name=site_name,
                     site_proxy=bool(self._config.get("proxy")),
                     title=title,
