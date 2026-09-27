@@ -9,8 +9,12 @@ Jackett 索引器插件（MoviePilot v3）
   把返回的种子以 TorrentInfo 形式回灌进搜索结果，站点名显示为「Jackett」。
 
 仓库结构（MoviePilot 插件市场格式）：
-  package.v3.json                      <- 插件索引（市场清单）
+  package.v3.json                      <- 插件索引（市场清单），键/id 与目录名、类名保持一致
   plugins.v3/jackettindexer/__init__.py <- 插件源码
+
+注意：MoviePilot 运行时以「类名」作为 running_plugins 的 key，而市场/URL 以「目录名/package id」
+作为 plugin_id；二者必须完全一致，否则 /api/v1/plugin/form 会返回 404（配置加载失败）。
+本插件目录名、类名、package id 统一为 jackettindexer。
 
 使用方式：
   1. 在 MoviePilot 后台「系统设置 -> 插件 -> 插件市场」追加本仓库地址
@@ -29,11 +33,13 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+# 导入路径对齐官方 JackettExtend（已在 MoviePilot v3 容器内验证可用），
+# 确保 TorrentInfo 真实导入成功，否则搜索会静默返回空。
 try:
-    from app.sdk.plugin import _PluginBase
-    from app.domain.context import TorrentInfo
-    from app.schemas.types import MediaType
-    from app.runtime.log import logger
+    from app.plugins import _PluginBase
+    from app.core.context import TorrentInfo
+    from app.schemas import MediaType
+    from app.log import logger
 except Exception:  # pragma: no cover - 独立运行兜底
     _PluginBase = object  # type: ignore
     TorrentInfo = None  # type: ignore
@@ -44,7 +50,7 @@ except Exception:  # pragma: no cover - 独立运行兜底
 _TORZNAB_NS = {"torznab": "http://torznab.com/schemas/2015/feed"}
 
 
-class JackettIndexer(_PluginBase):
+class jackettindexer(_PluginBase):
     # ---- 插件元信息（MoviePilot 后台展示用）----
     plugin_name = "Jackett 索引器"
     plugin_desc = "将 Jackett 作为站点接入 MoviePilot 搜索，返回全部索引器聚合结果。"
@@ -89,135 +95,141 @@ class JackettIndexer(_PluginBase):
         return []
 
     def get_form(self):
+        # 顶层用单个 VForm 根组件包裹，符合 MoviePilot v3 前端渲染契约
         return (
             [
                 {
-                    "component": "VRow",
+                    "component": "VForm",
                     "content": [
                         {
-                            "component": "VCol",
-                            "props": {"cols": 12, "md": 6},
+                            "component": "VRow",
                             "content": [
                                 {
-                                    "component": "VSwitch",
-                                    "props": {"label": "启用 Jackett 搜索", "model": True},
-                                    "id": "enabled",
-                                }
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 6},
+                                    "content": [
+                                        {
+                                            "component": "VSwitch",
+                                            "props": {"label": "启用 Jackett 搜索", "model": "enabled"},
+                                            "id": "enabled",
+                                        }
+                                    ],
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 6},
+                                    "content": [
+                                        {
+                                            "component": "VSwitch",
+                                            "props": {"label": "按媒体类型过滤分类", "model": "filter_by_type"},
+                                            "id": "filter_by_type",
+                                        }
+                                    ],
+                                },
                             ],
                         },
                         {
-                            "component": "VCol",
-                            "props": {"cols": 12, "md": 6},
+                            "component": "VRow",
                             "content": [
                                 {
-                                    "component": "VSwitch",
-                                    "props": {"label": "按媒体类型过滤分类", "model": True},
-                                    "id": "filter_by_type",
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 6},
+                                    "content": [
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
+                                                "label": "Jackett 地址",
+                                                "model": "jackett_url",
+                                                "placeholder": "http://192.168.2.220:9117",
+                                            },
+                                            "id": "jackett_url",
+                                        }
+                                    ],
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 6},
+                                    "content": [
+                                        {
+                                            "component": "VTextField",
+                                            "props": {"label": "API Key", "model": "api_key"},
+                                            "id": "api_key",
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 4},
+                                    "content": [
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
+                                                "label": "站点名称",
+                                                "model": "site_name",
+                                                "placeholder": "Jackett",
+                                            },
+                                            "id": "site_name",
+                                        }
+                                    ],
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 4},
+                                    "content": [
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
+                                                "label": "索引器ID (all=全部)",
+                                                "model": "indexer",
+                                                "placeholder": "all",
+                                            },
+                                            "id": "indexer",
+                                        }
+                                    ],
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12, "md": 4},
+                                    "content": [
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
+                                                "label": "超时(秒)",
+                                                "model": "timeout",
+                                                "type": "number",
+                                            },
+                                            "id": "timeout",
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "content": [
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12},
+                                    "content": [
+                                        {
+                                            "component": "VSwitch",
+                                            "props": {
+                                                "label": "走代理下载（Jackett 在局域网请保持关闭）",
+                                                "model": "proxy",
+                                            },
+                                            "id": "proxy",
+                                        }
+                                    ],
                                 }
                             ],
                         },
                     ],
-                },
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12, "md": 6},
-                            "content": [
-                                {
-                                    "component": "VTextField",
-                                    "props": {
-                                        "label": "Jackett 地址",
-                                        "model": True,
-                                        "placeholder": "http://192.168.2.220:9117",
-                                    },
-                                    "id": "jackett_url",
-                                }
-                            ],
-                        },
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12, "md": 6},
-                            "content": [
-                                {
-                                    "component": "VTextField",
-                                    "props": {"label": "API Key", "model": True},
-                                    "id": "api_key",
-                                }
-                            ],
-                        },
-                    ],
-                },
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12, "md": 4},
-                            "content": [
-                                {
-                                    "component": "VTextField",
-                                    "props": {
-                                        "label": "站点名称",
-                                        "model": True,
-                                        "placeholder": "Jackett",
-                                    },
-                                    "id": "site_name",
-                                }
-                            ],
-                        },
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12, "md": 4},
-                            "content": [
-                                {
-                                    "component": "VTextField",
-                                    "props": {
-                                        "label": "索引器ID (all=全部)",
-                                        "model": True,
-                                        "placeholder": "all",
-                                    },
-                                    "id": "indexer",
-                                }
-                            ],
-                        },
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12, "md": 4},
-                            "content": [
-                                {
-                                    "component": "VTextField",
-                                    "props": {
-                                        "label": "超时(秒)",
-                                        "model": True,
-                                        "type": "number",
-                                    },
-                                    "id": "timeout",
-                                }
-                            ],
-                        },
-                    ],
-                },
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VSwitch",
-                                    "props": {
-                                        "label": "走代理下载（Jackett 在局域网请保持关闭）",
-                                        "model": True,
-                                    },
-                                    "id": "proxy",
-                                }
-                            ],
-                        }
-                    ],
-                },
+                }
             ],
             self._default_config,
         )
@@ -396,11 +408,11 @@ class JackettIndexer(_PluginBase):
 
     @staticmethod
     def _attr_int(item: ET.Element, name: str) -> int:
-        return JackettIndexer._int(JackettIndexer._attr(item, name))
+        return jackettindexer._int(jackettindexer._attr(item, name))
 
     @staticmethod
     def _attr_float(item: ET.Element, name: str) -> Optional[float]:
-        v = JackettIndexer._attr(item, name)
+        v = jackettindexer._attr(item, name)
         try:
             return float(v) if v is not None else None
         except (TypeError, ValueError):
